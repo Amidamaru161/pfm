@@ -1,0 +1,35 @@
+# Core dependencies
+torch>=1.9.0
+torch-geometric>=2.0.0
+numpy>=1.21.0
+pandas>=1.3.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# RL and Environment
+gym>=0.21.0
+stable-baselines3>=1.3.0
+
+# Financial analysis
+quantstats>=0.0.37
+yfinance>=0.1.63
+
+# Monitoring
+tensorboard>=2.8.0
+tensorboardX>=2.4
+
+# Real-time integration
+aiohttp>=3.8.0
+websocket-client>=1.2.0
+asyncio>=3.4.3
+
+# Graph Neural Networks
+torch-scatter>=2.0.9
+torch-sparse>=0.6.12
+torch-cluster>=1.5.9
+torch-spline-conv>=1.2.1
+
+# Additional utilities
+tqdm>=4.62.0
+scikit-learn>=0.24.2
+scipy>=1.7.0 

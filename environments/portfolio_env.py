@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import math
@@ -425,18 +423,54 @@ class PortfolioOptimizationEnv(gym.Env):
         ][[self._time_column, self._tic_column] + self._features]
 
         # define price variation of this time_step
-        self._price_variation = self._df_price_variation[
+        price_var_data = self._df_price_variation[
             self._df_price_variation[self._time_column] == end_time
-        ][self._valuation_feature].to_numpy()
-        self._price_variation = np.insert(self._price_variation, 0, 1)
+        ]
+        
+        # Создаем массив price_variation правильного размера: cash + количество тикеров
+        self._price_variation = np.ones(len(self._tic_list) + 1)  # +1 для cash
+        
+        # Заполняем price_variation для каждого тикера в том же порядке что и в tic_list
+        for i, tic in enumerate(self._tic_list):
+            tic_price_var = price_var_data[price_var_data[self._tic_column] == tic]
+            if len(tic_price_var) > 0:
+                self._price_variation[i + 1] = tic_price_var[self._valuation_feature].iloc[0]
+            else:
+                # Если нет данных для тикера, используем 1.0 (без изменения)
+                self._price_variation[i + 1] = 1.0
+                print(f"Предупреждение: нет данных price_variation для тикера {tic} на дату {end_time}")
 
         # define state to be returned
         state = None
         for tic in self._tic_list:
             tic_data = self._data[self._data[self._tic_column] == tic]
-            tic_data = tic_data[self._features].to_numpy().T
-            tic_data = tic_data[..., np.newaxis]
-            state = tic_data if state is None else np.append(state, tic_data, axis=2)
+            
+            # Проверяем, есть ли данные для этого тикера
+            if len(tic_data) == 0:
+                # Если данных нет, заполняем нулями
+                tic_array = np.zeros((len(self._features), self._time_window))
+                print(f"Предупреждение: нет данных состояния для тикера {tic} на период {start_time} - {end_time}")
+            else:
+                # Преобразуем данные в массив
+                tic_array = tic_data[self._features].to_numpy().T
+                
+                # Проверяем размер временного окна
+                if tic_array.shape[1] < self._time_window:
+                    # Дополняем недостающие данные нулями или последним известным значением
+                    padding_size = self._time_window - tic_array.shape[1]
+                    # Используем forward fill - повторяем первое значение
+                    if tic_array.shape[1] > 0:
+                        padding = np.repeat(tic_array[:, 0:1], padding_size, axis=1)
+                    else:
+                        padding = np.zeros((len(self._features), padding_size))
+                    tic_array = np.concatenate([padding, tic_array], axis=1)
+                elif tic_array.shape[1] > self._time_window:
+                    # Обрезаем лишние данные
+                    tic_array = tic_array[:, -self._time_window:]
+            
+            tic_array = tic_array[..., np.newaxis]
+            state = tic_array if state is None else np.append(state, tic_array, axis=2)
+            
         state = state.transpose((0, 2, 1))
         info = {
             "tics": self._tic_list,
@@ -488,13 +522,14 @@ class PortfolioOptimizationEnv(gym.Env):
         # order time dataframe by tic and time
         if order:
             self._df = self._df.sort_values(by=[self._tic_column, self._time_column])
-        # defining price variation after ordering dataframe
-        self._df_price_variation = self._temporal_variation_df()
-        # select only stocks in portfolio
+        
+        # select only stocks in portfolio BEFORE creating price variation
         if tics_in_portfolio != "all":
-            self._df_price_variation = self._df_price_variation[
-                self._df_price_variation[self._tic_column].isin(tics_in_portfolio)
-            ]
+            self._df = self._df[self._df[self._tic_column].isin(tics_in_portfolio)]
+            
+        # defining price variation after filtering dataframe
+        self._df_price_variation = self._temporal_variation_df()
+        
         # apply normalization
         if normalize:
             self._normalize_dataframe(normalize)

@@ -11,442 +11,246 @@ from torch.utils.data import DataLoader
 from environments.portfolio_memory import PVM, ReplayBuffer, RLDataset, apply_portfolio_noise
 from tqdm import tqdm
 from models.hyper_net import HyperNetPortfolioRL
+from typing import Dict, Optional
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from agents.policy_gradient import PolicyGradient
+from models.models import EIIE
 
 
-class HyperNetPolicyGradient:
-    """Расширенная реализация алгоритма Policy Gradient для обучения агентов оптимизации портфеля
-    с поддержкой смешанных критериев оптимизации и многозадачного обучения.
-    """
+class HyperNet(nn.Module):
+    """Гиперсеть для генерации параметров основной политики"""
+    
+    def __init__(self, context_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.context_encoder = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # Генераторы для разных слоёв основной сети
+        self.weight_generators = nn.ModuleDict()
+        self.bias_generators = nn.ModuleDict()
+        
+    def add_generator(self, layer_name: str, weight_shape: torch.Size, bias_shape: Optional[torch.Size] = None):
+        """Добавление генератора для конкретного слоя"""
+        weight_size = np.prod(weight_shape)
+        self.weight_generators[layer_name] = nn.Linear(self.context_encoder[-2].out_features, weight_size)
+        
+        if bias_shape is not None:
+            bias_size = np.prod(bias_shape)
+            self.bias_generators[layer_name] = nn.Linear(self.context_encoder[-2].out_features, bias_size)
+    
+    def forward(self, context: torch.Tensor) -> Dict[str, Dict[str, torch.Tensor]]:
+        """Генерация параметров на основе контекста"""
+        encoded = self.context_encoder(context)
+        
+        params = {}
+        for layer_name, generator in self.weight_generators.items():
+            weight = generator(encoded)
+            params[layer_name] = {'weight': weight}
+            
+            if layer_name in self.bias_generators:
+                bias = self.bias_generators[layer_name](encoded)
+                params[layer_name]['bias'] = bias
+        
+        return params
+
+
+class AdaptivePolicy(nn.Module):
+    """Адаптивная политика с параметрами от гиперсети"""
+    
+    def __init__(self, base_policy: nn.Module, hypernet: HyperNet):
+        super().__init__()
+        self.base_policy = base_policy
+        self.hypernet = hypernet
+        
+        # Регистрируем генераторы для каждого слоя базовой политики
+        for name, module in base_policy.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                self.hypernet.add_generator(
+                    name, 
+                    module.weight.shape,
+                    module.bias.shape if module.bias is not None else None
+                )
+    
+    def forward(self, observation: torch.Tensor, last_action: torch.Tensor, context: torch.Tensor):
+        """Forward pass с адаптацией параметров"""
+        # Генерируем параметры на основе контекста
+        generated_params = self.hypernet(context)
+        
+        # Применяем сгенерированные параметры к базовой политике
+        with torch.no_grad():
+            for name, module in self.base_policy.named_modules():
+                if name in generated_params:
+                    # Модулируем существующие веса
+                    weight_mod = generated_params[name]['weight'].reshape(module.weight.shape)
+                    module.weight.data = module.weight.data + 0.1 * weight_mod
+                    
+                    if 'bias' in generated_params[name] and module.bias is not None:
+                        bias_mod = generated_params[name]['bias'].reshape(module.bias.shape)
+                        module.bias.data = module.bias.data + 0.1 * bias_mod
+        
+        return self.base_policy(observation, last_action)
+
+
+class HyperNetPolicyGradient(PolicyGradient):
+    """Policy Gradient с HyperNet для адаптивной оптимизации"""
     
     def __init__(
         self,
         env,
-        policy=HyperNetPortfolioRL,
+        policy=EIIE,
         policy_kwargs=None,
+        context_dim=32,
+        hypernet_hidden=256,
         validation_env=None,
         batch_size=100,
         lr=1e-3,
+        hypernet_lr=1e-4,
         action_noise=0,
-        risk_aversion=0.5,  # Параметр избегания риска (больше = меньше риска)
-        entropy_reg=0.01,   # Коэффициент регуляризации энтропии (для исследования)
-        device="cuda:0",
-        mixed_precision=True,  # Использование смешанной точности для ускорения обучения
-        gradient_clip=1.0,     # Ограничение градиентов для стабильности
-        max_episodes=1000,     # Максимальное количество эпизодов
-        target_sharpe=1.5,     # Целевой коэффициент Шарпа
-        adaptive_risk=True,    # Адаптивная настройка параметра риска
-        eval_interval=10,      # Интервал оценки
-        early_stopping=True,   # Ранняя остановка
-        patience=20,           # Количество эпизодов для ранней остановки
-        ensemble_size=0,       # Размер ансамбля (0 - без ансамбля)
-        save_path=None,        # Путь для сохранения модели
+        optimizer=torch.optim.AdamW,
+        device="cuda:0"
     ):
-        """Инициализирует расширенный алгоритм Policy Gradient для оптимизации портфеля.
-        
-        Args:
-          env: Среда обучения.
-          policy: Архитектура политики, которая будет использоваться.
-          policy_kwargs: Аргументы для сети политики.
-          validation_env: Среда валидации.
-          batch_size: Размер батча для обучения нейронной сети.
-          lr: Скорость обучения нейронной сети политики.
-          action_noise: Параметр шума (от 0 до 1), применяемый во время обучения.
-          risk_aversion: Параметр избегания риска (от 0 до 1).
-          entropy_reg: Коэффициент регуляризации энтропии для поощрения исследования.
-          device: Устройство, на котором запускается нейронная сеть.
-          mixed_precision: Использовать ли смешанную точность для ускорения обучения.
-          gradient_clip: Значение для ограничения градиентов.
-          max_episodes: Максимальное количество эпизодов для обучения.
-          target_sharpe: Целевой коэффициент Шарпа для ранней остановки.
-          adaptive_risk: Адаптивно настраивать параметр избегания риска.
-          eval_interval: Интервал эпизодов для оценки на валидационной среде.
-          early_stopping: Использовать ли раннюю остановку.
-          patience: Количество эпизодов без улучшения для ранней остановки.
-          ensemble_size: Размер ансамбля моделей (0 - без ансамбля).
-          save_path: Путь для сохранения модели.
         """
-        # Инициализация параметров обучения
-        self.policy = policy
-        self.policy_kwargs = {} if policy_kwargs is None else policy_kwargs
-        self.validation_env = validation_env
-        self.batch_size = batch_size
-        self.lr = lr
-        self.action_noise = action_noise
-        self.risk_aversion = risk_aversion
-        self.entropy_reg = entropy_reg
-        self.device = device
-        self.mixed_precision = mixed_precision
-        self.gradient_clip = gradient_clip
-        self.max_episodes = max_episodes
-        self.target_sharpe = target_sharpe
-        self.adaptive_risk = adaptive_risk
-        self.eval_interval = eval_interval
-        self.early_stopping = early_stopping
-        self.patience = patience
-        self.ensemble_size = ensemble_size
-        self.save_path = save_path
-        
-        # Настройка обучения и среды
-        self.train_env = env
-        self._setup_train(env, self.policy, self.batch_size, self.lr)
-        
-        # Дополнительно отслеживаем метрики обучения
-        self.train_metrics = {
-            'policy_loss': [],
-            'return': [],
-            'sharpe_ratio': [],
-            'max_drawdown': [],
-            'win_rate': [],
-            'consistency': [],
-            'turnover': []
-        }
-        
-        # Для ранней остановки
-        self.best_sharpe = -float('inf')
-        self.epochs_no_improve = 0
-        self.best_policy = None
-        
-        # Для ансамбля моделей
-        self.ensemble = []
-        if self.ensemble_size > 0:
-            for _ in range(self.ensemble_size):
-                self.ensemble.append(copy.deepcopy(self.train_policy))
-                
-        # Настройка scaler для смешанной точности
-        self.scaler = torch.cuda.amp.GradScaler() if self.mixed_precision and torch.cuda.is_available() else None
-        
-    def _setup_train(self, env, policy, batch_size, lr):
-        """Настраивает алгоритм перед обучением с расширенными возможностями.
-        
         Args:
-            env: Среда обучения.
-            policy: Архитектура политики.
-            batch_size: Размер батча.
-            lr: Скорость обучения.
+            env: Training Environment
+            policy: Policy architecture
+            policy_kwargs: Policy network arguments
+            context_dim: Dimension of market context
+            hypernet_hidden: Hidden dimension of hypernet
+            validation_env: Validation environment
+            batch_size: Batch size
+            lr: Policy learning rate
+            hypernet_lr: Hypernet learning rate
+            action_noise: Noise for exploration
+            optimizer: Optimizer class
+            device: Device for computation
         """
-        # Инициализация политики и оптимизатора
-        self.train_policy = policy(**self.policy_kwargs).to(self.device)
-        
-        # Оптимизатор с регуляризацией L2 (weight decay)
-        self.train_optimizer = torch.optim.AdamW(
-            self.train_policy.parameters(), 
-            lr=lr,
-            weight_decay=1e-5,
-            betas=(0.9, 0.999)
+        # Инициализируем базовый класс
+        super().__init__(
+            env, policy, policy_kwargs, validation_env,
+            batch_size, lr, action_noise, optimizer, device
         )
         
-        # Планировщик скорости обучения
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.train_optimizer, 
-            T_0=20,
-            T_mult=2,
-            eta_min=lr/10
-        )
+        self.context_dim = context_dim
         
-        # Инициализация буфера воспроизведения и памяти векторов портфеля
-        self.train_batch_size = batch_size
-        self.train_buffer = ReplayBuffer(capacity=batch_size * 2)  # Увеличиваем емкость для более стабильного обучения
-        self.train_pvm = PVM(env.episode_length, env.portfolio_size)
+        # Создаём гиперсеть
+        self.hypernet = HyperNet(context_dim, hypernet_hidden).to(device)
+        self.hypernet_optimizer = optimizer(self.hypernet.parameters(), lr=hypernet_lr)
         
-        # Настройка dataset и dataloader
-        dataset = RLDataset(self.train_buffer)
-        self.train_dataloader = DataLoader(
-            dataset=dataset, 
-            batch_size=batch_size, 
-            shuffle=None,  # Для IterableDataset shuffle должен быть None
-            pin_memory=True,
-            num_workers=0  # При необходимости можно увеличить
-        )
+        # Заменяем политику на адаптивную
+        self.train_policy = AdaptivePolicy(self.train_policy, self.hypernet).to(device)
         
-        # Настройка тестовых компонентов
-        if self.validation_env is not None:
-            self.test_policy = copy.deepcopy(self.train_policy)
-            self.test_optimizer = torch.optim.AdamW(
-                self.test_policy.parameters(), 
-                lr=lr/2,  # Меньшая скорость обучения для тестирования
-                weight_decay=1e-5
-            )
-            self.test_buffer = ReplayBuffer(capacity=batch_size)
-            self.test_pvm = PVM(self.validation_env.episode_length, self.validation_env.portfolio_size)
-            test_dataset = RLDataset(self.test_buffer)
-            self.test_dataloader = DataLoader(
-                dataset=test_dataset, 
-                batch_size=batch_size, 
-                shuffle=None,  # Для IterableDataset shuffle должен быть None
-                pin_memory=True
-            )
+        # Буфер для контекста
+        self.context_buffer = []
     
-    def train(self, episodes=None):
-        """Последовательность обучения с расширенными функциями.
-        
-        Args:
-            episodes: Количество эпизодов для симуляции (если None, используется self.max_episodes).
-        
-        Returns:
-            Словарь с метриками обучения.
-        """
-        if episodes is None:
-            episodes = self.max_episodes
+    def _extract_market_context(self, env_data) -> torch.Tensor:
+        """Извлечение рыночного контекста из данных среды"""
+        # Простой пример: используем статистики последних цен
+        if hasattr(self.train_env, '_data') and self.train_env._data is not None:
+            prices = self.train_env._data[self.train_env._features].values
             
-        # Инициализация метрик для отслеживания прогресса
-        episode_returns = []
-        episode_lengths = []
-        best_return = -float('inf')
-        
-        for episode in tqdm(range(1, episodes + 1), desc="Training"):
-            # Сбрасываем среду и память портфеля
+            context = []
+            # Волатильность
+            context.append(np.std(prices, axis=0).mean())
+            # Тренд
+            context.append(np.mean(np.diff(prices, axis=0)))
+            # Корреляция между активами
+            if prices.shape[1] > 1:
+                corr_matrix = np.corrcoef(prices.T)
+                context.append(np.mean(corr_matrix[np.triu_indices_from(corr_matrix, k=1)]))
+            else:
+                context.append(0.0)
+            
+            # Заполняем до нужной размерности
+            while len(context) < self.context_dim:
+                context.append(0.0)
+            
+            return torch.tensor(context[:self.context_dim], dtype=torch.float32)
+        else:
+            return torch.zeros(self.context_dim, dtype=torch.float32)
+    
+    def train(self, episodes=100):
+        """Обучение с адаптацией через гиперсеть"""
+        for i in range(1, episodes + 1):
             obs = self.train_env.reset()
             self.train_pvm.reset()
             done = False
-            episode_reward = 0
-            step_count = 0
-            turnover = 0  # Для отслеживания оборота портфеля
             
-            # Собираем траекторию для эпизода
+            # Извлекаем контекст для эпизода
+            context = self._extract_market_context(self.train_env).to(self.device)
+            
             while not done:
-                step_count += 1
-                
-                # Определяем последнее действие и новое действие
                 last_action = self.train_pvm.retrieve()
                 obs_batch = np.expand_dims(obs, axis=0)
                 last_action_batch = np.expand_dims(last_action, axis=0)
+                context_batch = context.unsqueeze(0)
                 
-                # Получаем действие от политики с шумом для исследования
-                action = apply_portfolio_noise(
-                    self.train_policy(obs_batch, last_action_batch), 
-                    self.action_noise * (1 - episode / episodes)  # Постепенно уменьшаем шум
-                )
-                
-                # Рассчитываем оборот портфеля (L1 разница между весами)
-                if step_count > 1:
-                    turnover += np.sum(np.abs(action - last_action))
-                
-                # Сохраняем действие в памяти портфеля
+                # Получаем действие с учётом контекста
+                action = self.train_policy(obs_batch, last_action_batch, context_batch)
+                action = apply_portfolio_noise(action, self.action_noise)
                 self.train_pvm.add(action)
                 
-                # Выполняем шаг в среде
                 next_obs, reward, done, info = self.train_env.step(action)
-                episode_reward += reward
                 
-                # Добавляем опыт в буфер воспроизведения
-                exp = (obs, last_action, info["price_variation"], info["trf_mu"])
+                # Сохраняем опыт с контекстом
+                exp = (obs, last_action, info["price_variation"], info["trf_mu"], context)
                 self.train_buffer.append(exp)
+                self.context_buffer.append(context)
                 
-                # Обновляем сети политики через градиентный подъем
-                if len(self.train_buffer) >= self.train_batch_size:
-                    loss_info = self._gradient_ascent()
-                    for k, v in loss_info.items():
-                        if k not in self.train_metrics:
-                            self.train_metrics[k] = []
-                        self.train_metrics[k].append(v)
+                if len(self.train_buffer) == self.train_batch_size:
+                    self._gradient_ascent_with_hypernet()
                 
-                # Сохраняем следующее наблюдение для следующего шага
                 obs = next_obs
             
-            # Градиентный подъем с оставшимися данными буфера после эпизода
-            if len(self.train_buffer) > 0:
-                self._gradient_ascent()
-                
-            # Обновляем планировщик скорости обучения
-            self.lr_scheduler.step()
+            # Финальное обновление
+            self._gradient_ascent_with_hypernet()
             
-            # Сохраняем метрики эпизода
-            episode_returns.append(episode_reward)
-            episode_lengths.append(step_count)
-            
-            # Адаптивная настройка параметра риска
-            if self.adaptive_risk and episode > 10:
-                returns = np.array(episode_returns[-10:])
-                sharpe = returns.mean() / (returns.std() + 1e-6)
-                
-                # Настраиваем параметр риска в зависимости от текущего коэффициента Шарпа
-                if sharpe < 0.8:  # Низкий коэффициент Шарпа - увеличиваем избегание риска
-                    self.risk_aversion = min(0.9, self.risk_aversion + 0.05)
-                elif sharpe > 1.5:  # Высокий коэффициент Шарпа - можем снизить избегание риска
-                    self.risk_aversion = max(0.1, self.risk_aversion - 0.05)
-            
-            # Валидация на каждые eval_interval эпизодов
-            if self.validation_env is not None and episode % self.eval_interval == 0:
-                val_metrics = self.test(self.validation_env)
-                
-                # Ранняя остановка, если необходимо
-                if self.early_stopping:
-                    current_sharpe = val_metrics.get('sharpe_ratio', -float('inf'))
-                    if current_sharpe > self.best_sharpe:
-                        self.best_sharpe = current_sharpe
-                        self.epochs_no_improve = 0
-                        # Сохраняем лучшую модель
-                        self.best_policy = copy.deepcopy(self.train_policy)
-                        
-                        # Сохраняем модель, если указан путь
-                        if self.save_path:
-                            self._save_model(self.save_path, episode, val_metrics)
-                    else:
-                        self.epochs_no_improve += 1
-                        
-                    # Проверяем условие ранней остановки
-                    if self.epochs_no_improve >= self.patience:
-                        print(f"Early stopping triggered after {episode} episodes")
-                        break
-                
-                # Проверяем, достигли ли целевого коэффициента Шарпа
-                if current_sharpe >= self.target_sharpe:
-                    print(f"Target Sharpe ratio {self.target_sharpe} reached after {episode} episodes")
-                    break
-                
-                # Выводим прогресс обучения
-                print(f"Episode {episode}/{episodes}, Return: {episode_reward:.4f}, "
-                      f"Sharpe: {current_sharpe:.4f}, Risk Aversion: {self.risk_aversion:.4f}")
-                
-            # Обновляем ансамбль моделей
-            if self.ensemble_size > 0 and episode % 10 == 0:
-                self._update_ensemble()
-        
-        # После обучения используем лучшую модель, если есть
-        if self.early_stopping and self.best_policy is not None:
-            self.train_policy = self.best_policy
-            
-        # Возвращаем метрики обучения
-        return self.train_metrics
+            # Валидация
+            if self.validation_env and i % 10 == 0:
+                self.test(self.validation_env)
+                print(f"Episode {i} completed")
     
-    def _gradient_ascent(self, test=False):
-        """Выполняет шаг градиентного подъема в алгоритме policy gradient с расширенными критериями.
+    def _gradient_ascent_with_hypernet(self):
+        """Gradient ascent с обновлением гиперсети"""
+        if len(self.train_buffer) == 0:
+            return
         
-        Args:
-            test: Если True, используются тестовые датлоадер и политика.
-            
-        Returns:
-            Словарь с информацией о потерях.
-        """
-        # Выбираем соответствующие компоненты
-        policy = self.test_policy if test else self.train_policy
-        optimizer = self.test_optimizer if test else self.train_optimizer
-        dataloader = self.test_dataloader if test else self.train_dataloader
+        # Получаем батч
+        batch = list(self.train_buffer.buffer)
+        self.train_buffer.clear()
         
-        # Получаем данные батча из датлоадера
-        try:
-            batch = next(iter(dataloader))
-        except StopIteration:
-            return {}  # Возвращаем пустой словарь, если датлоадер пуст
-            
-        obs, last_actions, price_variations, trf_mu = batch
+        obs, last_actions, price_variations, trf_mu, contexts = zip(*batch)
         
-        # Переносим данные на устройство
-        obs = obs.to(self.device)
-        last_actions = last_actions.to(self.device)
-        price_variations = price_variations.to(self.device)
-        trf_mu = trf_mu.unsqueeze(1).to(self.device)
+        obs = torch.tensor(np.array(obs), dtype=torch.float32).to(self.device)
+        last_actions = torch.tensor(np.array(last_actions), dtype=torch.float32).to(self.device)
+        price_variations = torch.tensor(np.array(price_variations), dtype=torch.float32).to(self.device)
+        trf_mu = torch.tensor(np.array(trf_mu), dtype=torch.float32).unsqueeze(1).to(self.device)
+        contexts = torch.stack(contexts).to(self.device)
         
-        # Выполняем вычисления с использованием смешанной точности, если включено
-        if self.mixed_precision and self.scaler is not None:
-            with torch.cuda.amp.autocast():
-                # Получаем распределение весов от политики
-                mu = policy.mu(obs, last_actions)
-                
-                # Основная цель PG: максимизация ожидаемой доходности
-                expected_return = torch.sum(mu * price_variations * trf_mu, dim=1)
-                log_returns = torch.log(expected_return + 1e-10)
-                policy_return_loss = -torch.mean(log_returns)
-                
-                # Оценка риска: минимизация волатильности
-                if self.risk_aversion > 0:
-                    returns = torch.sum(mu * price_variations, dim=1)
-                    portfolio_variance = torch.var(returns)
-                    risk_loss = self.risk_aversion * portfolio_variance
-                else:
-                    risk_loss = torch.tensor(0.0, device=self.device)
-                    
-                # Регуляризация энтропии для поощрения исследования
-                entropy = -torch.sum(mu * torch.log(mu + 1e-10), dim=1).mean()
-                entropy_loss = -self.entropy_reg * entropy
-                
-                # Основной компонент предсказания доходности (для самодистилляции)
-                if hasattr(policy, 'returns_predictor') and hasattr(policy, 'temporal_features'):
-                    # Используем сохраненные предсказания доходности
-                    returns_pred = policy.returns_pred  # [batch, assets]
-                    # Убедимся, что размерности совпадают
-                    target_returns = price_variations  # [batch, assets]
-                    # Проверяем и выравниваем размерности
-                    if returns_pred.size() != target_returns.size():
-                        # Если размерности не совпадают, берем среднее по активам
-                        returns_pred = returns_pred.mean(dim=-1, keepdim=True).expand_as(target_returns)
-                    pred_loss = F.mse_loss(returns_pred, target_returns)
-                else:
-                    pred_loss = torch.tensor(0.0, device=self.device)
-                
-                # Объединяем все компоненты потерь
-                total_loss = policy_return_loss + risk_loss + entropy_loss + 0.1 * pred_loss
-            
-            # Обновляем сеть политики с использованием scaler
-            optimizer.zero_grad()
-            self.scaler.scale(total_loss).backward()
-            self.scaler.unscale_(optimizer)
-            
-            # Ограничиваем градиенты для стабильности
-            if self.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), self.gradient_clip)
-                
-            self.scaler.step(optimizer)
-            self.scaler.update()
-        else:
-            # Стандартное вычисление без смешанной точности
-            # Получаем распределение весов от политики
-            mu = policy.mu(obs, last_actions)
-            
-            # Основная цель PG: максимизация ожидаемой доходности
-            expected_return = torch.sum(mu * price_variations * trf_mu, dim=1)
-            log_returns = torch.log(expected_return + 1e-10)
-            policy_return_loss = -torch.mean(log_returns)
-            
-            # Оценка риска: минимизация волатильности
-            if self.risk_aversion > 0:
-                returns = torch.sum(mu * price_variations, dim=1)
-                portfolio_variance = torch.var(returns)
-                risk_loss = self.risk_aversion * portfolio_variance
-            else:
-                risk_loss = torch.tensor(0.0, device=self.device)
-                
-            # Регуляризация энтропии для поощрения исследования
-            entropy = -torch.sum(mu * torch.log(mu + 1e-10), dim=1).mean()
-            entropy_loss = -self.entropy_reg * entropy
-            
-            # Основной компонент предсказания доходности (для самодистилляции)
-            if hasattr(policy, 'returns_predictor') and hasattr(policy, 'temporal_features'):
-                # Используем сохраненные предсказания доходности
-                returns_pred = policy.returns_pred  # [batch, assets]
-                # Убедимся, что размерности совпадают
-                target_returns = price_variations  # [batch, assets]
-                # Проверяем и выравниваем размерности
-                if returns_pred.size() != target_returns.size():
-                    # Если размерности не совпадают, берем среднее по активам
-                    returns_pred = returns_pred.mean(dim=-1, keepdim=True).expand_as(target_returns)
-                pred_loss = F.mse_loss(returns_pred, target_returns)
-            else:
-                pred_loss = torch.tensor(0.0, device=self.device)
-            
-            # Объединяем все компоненты потерь
-            total_loss = policy_return_loss + risk_loss + entropy_loss + 0.1 * pred_loss
-            
-            # Обновляем сеть политики
-            optimizer.zero_grad()
-            total_loss.backward()
-            
-            # Ограничиваем градиенты для стабильности
-            if self.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), self.gradient_clip)
-                
-            optimizer.step()
+        # Forward pass через адаптивную политику
+        mu = self.train_policy.base_policy.mu(obs, last_actions)
         
-        # Собираем и возвращаем информацию о потерях
-        loss_info = {
-            'policy_loss': policy_return_loss.item(),
-            'risk_loss': risk_loss.item(),
-            'entropy_loss': entropy_loss.item(),
-            'pred_loss': pred_loss.item() if isinstance(pred_loss, torch.Tensor) else 0.0,
-            'total_loss': total_loss.item()
-        }
+        # Policy loss
+        policy_loss = -torch.mean(
+            torch.log(torch.sum(mu * price_variations * trf_mu, dim=1))
+        )
         
-        return loss_info
+        # Обновляем все параметры
+        self.train_optimizer.zero_grad()
+        self.hypernet_optimizer.zero_grad()
+        
+        policy_loss.backward()
+        
+        self.train_optimizer.step()
+        self.hypernet_optimizer.step()
+        
+        # Очищаем буфер контекста
+        self.context_buffer.clear()
     
     def test(self, test_env, policy=None, online_training_period=10, learning_rate=None, optimizer=None):
         """Тестирует модель в тестовом окружении.
